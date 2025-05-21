@@ -1,0 +1,62 @@
+name: Deploy to Azure
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/mcp-agent/**'
+      - 'src/rag-system/**'
+      - 'src/dj-agents/**'
+      - 'infrastructure/azure/**'
+      - '.github/workflows/azure-deploy.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy-azure-resources:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          
+      - name: Deploy ARM Templates
+        uses: azure/arm-deploy@v1
+        with:
+          resourceGroupName: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          template: ./infrastructure/azure/arm-templates/container-instances.json
+          parameters: location=${{ secrets.AZURE_LOCATION }}
+          
+      - name: Build and Push MCP Agent Container
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
+          username: ${{ secrets.AZURE_REGISTRY_USERNAME }}
+          password: ${{ secrets.AZURE_REGISTRY_PASSWORD }}
+      
+      - name: Build and Push MCP Agent
+        run: |
+          cd src/mcp-agent
+          docker build -t ${{ secrets.AZURE_CONTAINER_REGISTRY }}/mcp-agent:${{ github.sha }} .
+          docker push ${{ secrets.AZURE_CONTAINER_REGISTRY }}/mcp-agent:${{ github.sha }}
+          
+      - name: Update Container Instance
+        run: |
+          az container create \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name rasta-radio-mcp \
+            --image ${{ secrets.AZURE_CONTAINER_REGISTRY }}/mcp-agent:${{ github.sha }} \
+            --registry-login-server ${{ secrets.AZURE_CONTAINER_REGISTRY }} \
+            --registry-username ${{ secrets.AZURE_REGISTRY_USERNAME }} \
+            --registry-password ${{ secrets.AZURE_REGISTRY_PASSWORD }} \
+            --cpu 1 \
+            --memory 1.5 \
+            --ports 80 \
+            --dns-name-label rasta-radio-mcp
+            
+      - name: Deploy RAG System
+        run: |
+          cd src/rag-system
+          func azure functionapp publish ${{ secrets.AZURE_FUNCTION_APP_NAME }} --python

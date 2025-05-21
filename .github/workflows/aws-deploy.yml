@@ -1,0 +1,92 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/streaming/**'
+      - 'src/audio-processing/**'
+      - 'src/api/**'
+      - 'infrastructure/aws/**'
+      - '.github/workflows/aws-deploy.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy-aws-resources:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          
+      - name: Deploy CloudFormation Stacks
+        run: |
+          aws cloudformation deploy \
+            --template-file infrastructure/aws/cloudformation/streaming.yml \
+            --stack-name rasta-radio-streaming \
+            --parameter-overrides KeyName=${{ secrets.AWS_KEY_NAME }}
+            
+      - name: Setup Streaming Server
+        run: |
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=rasta-radio-streaming" \
+            --query "Reservations[].Instances[].InstanceId" \
+            --output text)
+            
+          aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+          
+          INSTANCE_IP=$(aws ec2 describe-instances \
+            --instance-ids $INSTANCE_ID \
+            --query "Reservations[].Instances[].PublicIpAddress" \
+            --output text)
+            
+          # Copy setup script and configuration
+          scp -i ${{ secrets.AWS_KEY_PATH }} -o StrictHostKeyChecking=no \
+            infrastructure/aws/scripts/setup-icecast.sh \
+            ec2-user@$INSTANCE_IP:/home/ec2-user/
+            
+          scp -i ${{ secrets.AWS_KEY_PATH }} -o StrictHostKeyChecking=no \
+            src/streaming/icecast.xml \
+            ec2-user@$INSTANCE_IP:/home/ec2-user/
+            
+          # Run setup script
+          ssh -i ${{ secrets.AWS_KEY_PATH }} -o StrictHostKeyChecking=no \
+            ec2-user@$INSTANCE_IP "chmod +x setup-icecast.sh && ./setup-icecast.sh"
+            
+      - name: Update DNS Record
+        run: |
+          INSTANCE_IP=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=rasta-radio-streaming" \
+            --query "Reservations[].Instances[].PublicIpAddress" \
+            --output text)
+            
+          # Create record set file
+          cat > record-set.json << EOF
+          {
+            "Changes": [
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "radio.jahblesslion.shop",
+                  "Type": "A",
+                  "TTL": 300,
+                  "ResourceRecords": [
+                    {
+                      "Value": "$INSTANCE_IP"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+          EOF
+          
+          # Apply record set
+          aws route53 change-resource-record-sets \
+            --hosted-zone-id ${{ secrets.AWS_HOSTED_ZONE_ID }} \
+            --change-batch file://record-set.json
